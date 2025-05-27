@@ -1,0 +1,112 @@
+#version-4
+import os
+import cv2
+import numpy as np
+import librosa
+import moviepy.editor as mp
+from scipy.stats import pearsonr
+from sklearn.ensemble import RandomForestClassifier
+def extract_audio_and_frames(video_path):
+    print("[Step 1] Extracting audio and frames from video...")
+    clip = mp.VideoFileClip(video_path)
+    audio_path = "extracted_audio.wav"
+    clip.audio.write_audiofile(audio_path, verbose=False, logger=None)
+
+    vidcap = cv2.VideoCapture(video_path)
+    frames = []
+    while True:
+        success, frame = vidcap.read()
+        if not success:
+            break
+        frame = cv2.resize(frame, (224, 224))
+        frames.append(frame)
+    vidcap.release()
+    print(f"Extracted {len(frames)} frames and saved audio as '{audio_path}'")
+    return frames, audio_path
+
+def extract_mouth_movement(frames):
+    print("[Step 2] Extracting lip movement features from frames...")
+    mouth_movements = []
+    for frame in frames:
+        mouth_region = frame[140:180, 90:130]
+        mouth_gray = cv2.cvtColor(mouth_region, cv2.COLOR_BGR2GRAY)
+        movement = np.sum(cv2.absdiff(mouth_gray, cv2.GaussianBlur(mouth_gray, (5, 5), 0)))
+        mouth_movements.append(movement)
+    print(f"Extracted mouth movement data from {len(mouth_movements)} frames")
+    return mouth_movements
+
+def extract_audio_features(audio_path):
+    print("[Step 3] Extracting MFCCs and audio energy...")
+    y, sr = librosa.load(audio_path)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    frame_length = int(0.04 * sr)
+    hop_length = int(0.02 * sr)
+    energy = np.array([
+        np.sum(np.abs(y[i:i+frame_length])**2)
+        for i in range(0, len(y)-frame_length, hop_length)
+    ])
+    print(f"Extracted MFCC shape: {mfcc.shape}, Energy length: {len(energy)}")
+    return mfcc, energy
+
+def calculate_lip_sync_inconsistency(mouth_movements, audio_energy):
+    print("[Step 4] Calculating lip-sync inconsistency...")
+    min_len = min(len(mouth_movements), len(audio_energy))
+    mouth_movements = mouth_movements[:min_len]
+    audio_energy = audio_energy[:min_len]
+
+    if np.std(mouth_movements) == 0 or np.std(audio_energy) == 0:
+        correlation = 0
+    else:
+        correlation, _ = pearsonr(mouth_movements, audio_energy)
+        if np.isnan(correlation):
+            correlation = 0
+    lip_sync_score = min(abs(1 - correlation), 1.0)
+    print(f"Lip-sync correlation: {correlation:.3f}, Inconsistency Score: {lip_sync_score:.3f}")
+    return lip_sync_score
+
+def detect_synthetic_voice(mfcc):
+    from sklearn.ensemble import RandomForestClassifier
+    X = mfcc.T  # Shape (n_samples, n_features)
+
+    # Ensure both classes are present in mock training data
+    num_samples = X.shape[0]
+    y = np.array([0] * (num_samples // 2) + [1] * (num_samples - num_samples // 2))
+    np.random.shuffle(y)
+
+    clf = RandomForestClassifier(n_estimators=10, random_state=42)
+    clf.fit(X, y)
+
+    prob_dist = clf.predict_proba(X)
+    # Check if class 1 exists in the model
+    if clf.classes_.tolist().count(1) == 0:
+        prob = 0.0
+    else:
+        class1_index = clf.classes_.tolist().index(1)
+        prob = prob_dist[0][class1_index]
+
+    print(f"Voice synthetic probability score: {prob:.3f}")
+    return prob
+
+def calculate_suspicion_score(lip_sync_score, voice_score, weight_lip=0.6, weight_voice=0.4):
+    print("[Step 6] Calculating weighted suspicion score...")
+    score = (weight_lip * lip_sync_score + weight_voice * voice_score)
+    final_score = min(score, 1.0)
+    print(f"Lip-sync score: {lip_sync_score:.3f}, Voice score: {voice_score:.3f}")
+    return final_score
+
+def inference_pipeline(video_path):
+    print("\n⏳ Starting inference pipeline...")
+    frames, audio_path = extract_audio_and_frames(video_path)
+    mouth_movements = extract_mouth_movement(frames)
+    mfcc, energy = extract_audio_features(audio_path)
+    lip_sync_score = calculate_lip_sync_inconsistency(mouth_movements, energy)
+    voice_score = detect_synthetic_voice(mfcc)
+    final_score = calculate_suspicion_score(lip_sync_score, voice_score)
+
+    print(f"\n🔎 Deepfake Suspicion Score: {final_score:.2f} (0-1 scale)")
+    if final_score > 0.85:
+        print("⚠ Likely deepfake.")
+    elif final_score > 0.65:
+        print("⚠ Possibly suspicious.")
+    else:
+        print("✅ Likely authentic.")
