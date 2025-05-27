@@ -1,0 +1,120 @@
+
+import os
+import cv2
+import numpy as np
+import librosa
+from moviepy.editor import VideoFileClip
+from scipy.stats import pearsonr
+from sklearn.ensemble import RandomForestClassifier
+import joblib
+import warnings
+
+warnings.filterwarnings("ignore")
+
+def extract_audio_and_frames(video_path, audio_out='extracted_audio.wav', frame_dir='frames', fps=5):
+    print("[Step 1] Extracting audio and frames from video...")
+    clip = VideoFileClip(video_path)
+    clip.audio.write_audiofile(audio_out, logger=None)
+
+    if not os.path.exists(frame_dir):
+        os.makedirs(frame_dir)
+
+    duration = clip.duration
+    for i, t in enumerate(np.arange(0, duration, 1.0 / fps)):
+        frame = clip.get_frame(t)
+        frame_path = os.path.join(frame_dir, f"frame_{i:03d}.jpg")
+        cv2.imwrite(frame_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+    print(f"Extracted {i+1} frames and saved audio as '{audio_out}'")
+    return audio_out, frame_dir
+
+def extract_lip_movement_features(frame_dir):
+    print("[Step 2] Extracting lip movement features from frames...")
+    mouth_movements = []
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+
+    for file in sorted(os.listdir(frame_dir)):
+        if file.endswith(".jpg"):
+            path = os.path.join(frame_dir, file)
+            img = cv2.imread(path)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+
+            mouth_area = 0
+            for (x, y, w, h) in faces:
+                mouth_y = y + int(0.6 * h)
+                mouth_h = int(0.2 * h)
+                mouth = gray[mouth_y:mouth_y + mouth_h, x:x + w]
+                mouth_area = cv2.countNonZero(mouth)
+
+            mouth_movements.append(mouth_area)
+
+    print(f"Extracted mouth movement data from {len(mouth_movements)} frames")
+    return mouth_movements
+
+def extract_audio_features(audio_path, sr=16000):
+    print("[Step 3] Extracting MFCCs and audio energy...")
+    y, sr = librosa.load(audio_path, sr=sr)
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    energy = np.sum(librosa.feature.rms(y=y), axis=1)
+    print(f"Extracted MFCC shape: {mfccs.shape}, Energy length: {len(energy)}")
+    return mfccs, energy
+
+def calculate_lipsync_inconsistency(mouth_movements, audio_energy):
+    print("[Step 4] Calculating lip-sync inconsistency...")
+    length = min(len(mouth_movements), len(audio_energy))
+    if length < 2:
+        print("Insufficient data for correlation calculation")
+        return 1.0  # High suspicion if insufficient data
+
+    mouth_movements = np.array(mouth_movements[:length])
+    audio_energy = np.array(audio_energy[:length])
+    corr, _ = pearsonr(mouth_movements, audio_energy)
+    print(f"Lip-sync Pearson correlation: {corr:.3f}")
+    return 1 - corr  # 1 = no sync, 0 = perfect sync
+
+def synthetic_voice_detection(mfccs):
+    print("[Step 5] Running synthetic voice detection...")
+    mean_mfcc = np.mean(mfccs, axis=1)
+    std_mfcc = np.std(mfccs, axis=1)
+    features = np.concatenate((mean_mfcc, std_mfcc)).reshape(1, -1)
+
+    if os.path.exists("voice_model.pkl"):
+        clf = joblib.load("voice_model.pkl")
+    else:
+        # Mock classifier (for MVP demonstration)
+        X_dummy = np.random.rand(20, 26)
+        y_dummy = [0]*10 + [1]*10
+        clf = RandomForestClassifier()
+        clf.fit(X_dummy, y_dummy)
+        joblib.dump(clf, "voice_model.pkl")
+        print("Trained mock voice detection model")
+
+    prob = clf.predict_proba(features)[0][1]
+    print(f"Voice synthetic probability score: {prob:.3f}")
+    return prob  # 0 = likely real, 1 = likely synthetic
+
+def calculate_overall_score(lipsync_score, voice_score, w1=0.6, w2=0.4):
+    print("[Step 6] Calculating weighted suspicion score...")
+    print(f"Lip-sync score: {lipsync_score:.3f}, Voice score: {voice_score:.3f}")
+    return w1 * lipsync_score + w2 * voice_score
+
+def run_inference(video_path):
+    print("⏳ Starting inference pipeline...")
+    audio, frames = extract_audio_and_frames(video_path)
+
+    lips = extract_lip_movement_features(frames)
+    mfccs, energy = extract_audio_features(audio)
+
+    lip_score = calculate_lipsync_inconsistency(lips, energy)
+    voice_score = synthetic_voice_detection(mfccs)
+
+    final_score = calculate_overall_score(lip_score, voice_score)
+
+    print(f"\n🔎 Deepfake Suspicion Score: {final_score:.2f} (0-1 scale)")
+    if final_score > 0.7:
+        print("⚠ Likely deepfake.")
+    elif final_score > 0.4:
+        print("⚠ Possibly suspicious.")
+    else:
+        print("✅ Likely authentic.")
